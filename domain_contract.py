@@ -5,11 +5,15 @@
 - 协议条款（展期/展厅/照度/运输/保险/数字传播）；
 - 五种交接的双方签认与生命周期顺序；
 - 重复扫码幂等；
-- 损伤即冻结、前后图像哈希保全；
+- 损伤即冻结、前后图像哈希保全；冻结由未解除事件派生，
+  解除须登记复核责任人，重复解除幂等，多个事件可乱序处理；
 - 展签发布即锁定证据快照，学术更正只另起新版；
-- 跨馆改期与局部状态争议下，从展签/区段定位实体、保管、授权与风险。
+- 跨馆改期与局部状态争议下，从展签/区段定位实体、保管、授权与风险；
+- 状态快照在服务重启后恢复未解除风险与交接进度。
 """
 
+import json
+import threading
 import unittest
 
 from domain import (
@@ -300,8 +304,12 @@ class DamageAndFreezeTest(unittest.TestCase):
         incident = self.registry.risk_view(self.work_id)["open_risks"][0]
         with self.assertRaises(DomainError):
             self.registry.resolve_incident(incident["incident_id"], "  ")
-        result = self.registry.resolve_incident(incident["incident_id"], "修复师与双方馆员复核，确认可继续展出")
+        result = self.registry.resolve_incident(
+            incident["incident_id"], "修复师与双方馆员复核，确认可继续展出",
+            reviewed_by="复核员甲",
+        )
         self.assertTrue(result["resolved"])
+        self.assertFalse(result["frozen"])
         self.assertFalse(self.registry.get_work_view(self.work_id)["frozen"])
         self.registry.record_handover(
             handover_payload(self.work_id, "布展", "SCAN-3", "2026-09-30"))
@@ -416,6 +424,243 @@ class SegmentDisputeTest(unittest.TestCase):
         risk2 = self.registry.risk_view(self.work_id)
         self.assertEqual(risk2["authorization"]["max_lux"], 30)
         self.assertEqual(risk2["authorization"]["version"], 2)
+
+
+class MultiIncidentFreezeTest(unittest.TestCase):
+    """损伤事件与作品冻结的关联：冻结由未解除事件派生，解除可乱序、可重试。"""
+
+    def setUp(self):
+        self.registry = LoanRegistry()
+        work = self.registry.register_work("寒林重汀", "独立作品", "甲馆")
+        self.work_id = work["work"]["work_id"]
+        self.registry.create_agreement(agreement_payload(self.work_id))
+        self.outbound = self.registry.record_handover(
+            handover_payload(self.work_id, "出库", "SCAN-1", "2026-09-25"))
+
+    def _damaged_handover(self, htype, scan, day, note):
+        return self.registry.record_handover(handover_payload(
+            self.work_id, htype, scan, day,
+            report={"condition": "损伤", "damage_note": note,
+                    "before_hashes": ["a" * 64], "after_hashes": ["b" * 64]},
+        ))
+
+    def _late_incident(self, note="复核出库照片时发现第二处旧伤"):
+        return self.registry.register_incident({
+            "work_id": self.work_id,
+            "handover_id": self.outbound["handover_id"],
+            "on_date": "2026-09-28",
+            "note": note,
+            "before_hashes": ["c" * 64],
+            "after_hashes": ["d" * 64],
+        })
+
+    def test_consecutive_redamage_freezes_again(self):
+        """连续复损：第一次解除后交接恢复，第二次损伤重新冻结并继续阻断。"""
+        first = self._damaged_handover("到馆", "SCAN-2", "2026-09-27", "第一处折痕")
+        self.registry.resolve_incident(
+            first["incident_id"], "第一处修复完成", reviewed_by="复核员甲")
+        self.assertFalse(self.registry.get_work_view(self.work_id)["frozen"])
+
+        second = self._damaged_handover("布展", "SCAN-3", "2026-09-30", "第二处霉斑")
+        self.assertTrue(second["frozen"])
+        view = self.registry.get_work_view(self.work_id)
+        self.assertTrue(view["frozen"])
+        self.assertEqual(view["open_incidents"], [second["incident_id"]])
+        risk = self.registry.risk_view(self.work_id)
+        self.assertTrue(risk["frozen"])
+        self.assertEqual([r["incident_id"] for r in risk["open_risks"]],
+                         [second["incident_id"]])
+        with self.assertRaises(ConflictError):
+            self.registry.record_handover(
+                handover_payload(self.work_id, "撤展", "SCAN-4", "2027-01-05"))
+
+    def test_re_resolving_old_incident_is_idempotent_and_keeps_freeze(self):
+        """旧事件重复解除：幂等返回原记录，不撤掉仍开放事件维持的冻结。"""
+        first = self._damaged_handover("到馆", "SCAN-2", "2026-09-27", "第一处折痕")
+        self.registry.resolve_incident(
+            first["incident_id"], "第一处修复完成", reviewed_by="复核员甲")
+        second = self._damaged_handover("布展", "SCAN-3", "2026-09-30", "第二处霉斑，仍在复核")
+
+        # 工作人员误点第一次事件的解除：幂等返回，不改动任何状态。
+        again = self.registry.resolve_incident(first["incident_id"], "误点重复提交")
+        self.assertTrue(again["resolved"])
+        self.assertTrue(again["idempotent"])
+        self.assertEqual(again["resolution_note"], "第一处修复完成")
+        self.assertEqual(again["reviewed_by"], "复核员甲")
+        self.assertTrue(again["frozen"])
+        self.assertEqual(again["open_incidents"], [second["incident_id"]])
+
+        # 作品视图与风险视图一致：第二次损伤仍开放，交接继续被阻断。
+        self.assertTrue(self.registry.get_work_view(self.work_id)["frozen"])
+        risk = self.registry.risk_view(self.work_id)
+        self.assertTrue(risk["frozen"])
+        self.assertEqual(len(risk["open_risks"]), 1)
+        with self.assertRaises(ConflictError):
+            self.registry.record_handover(
+                handover_payload(self.work_id, "撤展", "SCAN-4", "2027-01-05"))
+
+    def test_out_of_order_resolution_unfreezes_only_after_last_open_incident(self):
+        """乱序解除：先解除后登记的事件，最后一项风险关闭才解冻并恢复交接。"""
+        damaged = self._damaged_handover("到馆", "SCAN-2", "2026-09-27", "交接时发现第一处损伤")
+        first_id = damaged["incident_id"]
+        late = self._late_incident()
+        second_id = late["incident_id"]
+        self.assertTrue(late["frozen"])
+        self.assertEqual(len(self.registry.risk_view(self.work_id)["open_risks"]), 2)
+
+        # 乱序：先解除后登记的第二处，第一处未解除，冻结必须保持。
+        step1 = self.registry.resolve_incident(
+            second_id, "第二处认定为旧伤，不影响展出", reviewed_by="复核员乙")
+        self.assertTrue(step1["frozen"])
+        self.assertEqual(step1["open_incidents"], [first_id])
+        with self.assertRaises(ConflictError):
+            self.registry.record_handover(
+                handover_payload(self.work_id, "布展", "SCAN-3", "2026-09-30"))
+
+        # 最后一项风险关闭：冻结解除，被阻断期间拒绝过的扫码可重新使用。
+        step2 = self.registry.resolve_incident(
+            first_id, "第一处修复完成，双方确认", reviewed_by="复核员甲")
+        self.assertFalse(step2["frozen"])
+        self.assertEqual(step2["open_incidents"], [])
+        self.assertEqual(self.registry.risk_view(self.work_id)["open_risks"], [])
+        self.assertFalse(self.registry.get_work_view(self.work_id)["frozen"])
+        self.registry.record_handover(
+            handover_payload(self.work_id, "布展", "SCAN-3", "2026-09-30"))
+
+    def test_resolution_validates_work_state_and_reviewer(self):
+        """解除记录校验：作品须匹配、须登记复核责任人、未解除前状态保持。"""
+        damaged = self._damaged_handover("到馆", "SCAN-2", "2026-09-27", "画心损伤")
+        incident_id = damaged["incident_id"]
+        other = self.registry.register_work("另一件", "独立作品", "甲馆")
+
+        # 校验作品：解除记录指向其他作品时拒绝。
+        with self.assertRaises(ConflictError):
+            self.registry.resolve_incident(
+                incident_id, "复核通过", reviewed_by="复核员甲",
+                expected_work_id=other["work"]["work_id"])
+        # 校验复核责任：必须登记复核责任人。
+        with self.assertRaises(DomainError):
+            self.registry.resolve_incident(incident_id, "复核通过", reviewed_by="  ")
+        # 校验当前状态：上述失败均未改变冻结。
+        self.assertTrue(self.registry.get_work_view(self.work_id)["frozen"])
+
+        done = self.registry.resolve_incident(
+            incident_id, "复核通过", reviewed_by="复核员甲",
+            expected_work_id=self.work_id, reviewed_on="2026-09-29")
+        self.assertTrue(done["resolved"])
+        self.assertEqual(done["reviewed_by"], "复核员甲")
+        self.assertEqual(done["resolved_on"], "2026-09-29")
+        # 不存在的损伤事件仍然报错。
+        with self.assertRaises(DomainError):
+            self.registry.resolve_incident("incident-9999", "复核通过", reviewed_by="复核员甲")
+
+    def test_late_incident_must_reference_handover_of_same_work(self):
+        other = self.registry.register_work("另一件", "独立作品", "甲馆")
+        with self.assertRaises(DomainError):
+            self.registry.register_incident({
+                "work_id": other["work"]["work_id"],
+                "handover_id": self.outbound["handover_id"],
+                "note": "挂错作品的损伤",
+            })
+        with self.assertRaises(DomainError):
+            self.registry.register_incident({
+                "work_id": self.work_id, "handover_id": "handover-9999", "note": "无交接",
+            })
+
+    def test_concurrent_resolves_and_scans_do_not_overwrite(self):
+        """并发：同一事件重复解除幂等，不同事件乱序解除互不覆盖，同码交接只成立一次。"""
+        damaged = self._damaged_handover("到馆", "SCAN-2", "2026-09-27", "第一处损伤")
+        first_id = damaged["incident_id"]
+        second_id = self._late_incident()["incident_id"]
+
+        results, errors = [], []
+        barrier = threading.Barrier(6)
+
+        def resolve(iid, note):
+            try:
+                barrier.wait(timeout=5)
+                results.append(self.registry.resolve_incident(iid, note, reviewed_by="复核员"))
+            except Exception as error:  # noqa: BLE001 - 测试需收集一切并发异常
+                errors.append(error)
+
+        threads = [threading.Thread(target=resolve, args=(first_id, f"结论-{i}")) for i in range(3)]
+        threads += [threading.Thread(target=resolve, args=(second_id, f"结论-{i}")) for i in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 6)
+        # 每个事件只解除一次：并发响应一致地返回同一份解除记录。
+        for incident_id in (first_id, second_id):
+            notes = {r["resolution_note"] for r in results if r["incident_id"] == incident_id}
+            self.assertEqual(len(notes), 1)
+        # 两个事件都已解除，冻结撤掉。
+        self.assertFalse(self.registry.get_work_view(self.work_id)["frozen"])
+
+        # 并发提交同一扫码的下一步交接：只有一次成立，其余 409。
+        outcomes = []
+
+        def attempt_handover():
+            try:
+                self.registry.record_handover(
+                    handover_payload(self.work_id, "布展", "SCAN-RACE", "2026-09-30"))
+                outcomes.append("ok")
+            except ConflictError:
+                outcomes.append("conflict")
+
+        racers = [threading.Thread(target=attempt_handover) for _ in range(5)]
+        for thread in racers:
+            thread.start()
+        for thread in racers:
+            thread.join(timeout=10)
+        self.assertEqual(outcomes.count("ok"), 1)
+        self.assertEqual(outcomes.count("conflict"), 4)
+        self.assertEqual(
+            len([h for h in self.registry.handovers if h.scan_code == "SCAN-RACE"]), 1)
+
+    def test_snapshot_restore_preserves_open_incidents_and_chain(self):
+        """服务重启：快照恢复后未解除事件继续阻断，扫码去重与交接进度保留。"""
+        damaged = self._damaged_handover("到馆", "SCAN-2", "2026-09-27", "第一处损伤")
+        first_id = damaged["incident_id"]
+        second_id = self._late_incident()["incident_id"]
+
+        # 经 JSON 往返恢复，与服务落盘格式一致。
+        restored = LoanRegistry.restore(json.loads(json.dumps(self.registry.snapshot())))
+
+        view = restored.get_work_view(self.work_id)
+        self.assertTrue(view["frozen"])
+        self.assertEqual(set(view["open_incidents"]), {first_id, second_id})
+        self.assertEqual(len(restored.risk_view(self.work_id)["open_risks"]), 2)
+        # 交接进度与保管状态恢复。
+        self.assertEqual(view["custody"]["status"], "待布展")
+        # 重复扫码仍然 409。
+        with self.assertRaises(ConflictError):
+            restored.record_handover(
+                handover_payload(self.work_id, "到馆", "SCAN-2", "2026-09-27"))
+        # 冻结中的下一步交接仍被阻断。
+        with self.assertRaises(ConflictError):
+            restored.record_handover(
+                handover_payload(self.work_id, "布展", "SCAN-3", "2026-09-30"))
+
+        # 乱序解除在恢复后仍然有效，最后一项关闭后交接继续。
+        restored.resolve_incident(second_id, "第二处结论", reviewed_by="复核员乙")
+        self.assertTrue(restored.get_work_view(self.work_id)["frozen"])
+        restored.resolve_incident(first_id, "第一处结论", reviewed_by="复核员甲")
+        self.assertFalse(restored.get_work_view(self.work_id)["frozen"])
+        restored.record_handover(
+            handover_payload(self.work_id, "布展", "SCAN-3", "2026-09-30"))
+
+        # 恢复后新记录编号不与快照中的既有记录冲突。
+        again = restored.register_work("重启后登记", "独立作品", "甲馆")
+        self.assertNotIn(again["work"]["work_id"], {self.work_id})
+        new_incident = restored.register_incident({
+            "work_id": self.work_id,
+            "handover_id": self.outbound["handover_id"],
+            "note": "重启后补登记的损伤",
+        })
+        self.assertNotIn(new_incident["incident_id"], {first_id, second_id})
 
 
 if __name__ == "__main__":

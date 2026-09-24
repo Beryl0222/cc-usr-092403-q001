@@ -1,12 +1,14 @@
 """馆际作品借展的运行入口。
 
 提供健康检查与领域 JSON 接口；领域规则全部在 domain.py，
-本模块只负责 HTTP 编解码与状态码映射。
+本模块只负责 HTTP 编解码、状态码映射与状态落盘。
 """
 
 import argparse
 import json
+import os
 import re
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from domain import (
@@ -27,11 +29,30 @@ def health_payload():
 
 
 class ApiState:
-    """进程内共享的领域记录（单实例部署足够；多实例需换持久层）。"""
+    """进程内共享的领域记录。
 
-    def __init__(self):
+    指定 state_file 时：启动加载既有快照（服务重启后状态恢复），
+    每次成功的写操作后原子落盘；未指定时保持纯内存运行。
+    """
+
+    def __init__(self, state_file=None):
+        self.state_file = state_file
+        # 串行化请求处理与落盘，并发请求不会互相覆盖。
+        self.lock = threading.RLock()
         self.registry = LoanRegistry()
+        if state_file and os.path.exists(state_file):
+            with open(state_file, "r", encoding="utf-8") as handle:
+                self.registry = LoanRegistry.restore(json.load(handle))
         self.routes = build_routes()
+
+    def persist(self):
+        """把当前领域状态原子写回状态文件（未配置文件时跳过）。"""
+        if not self.state_file:
+            return
+        tmp_path = self.state_file + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(self.registry.snapshot(), handle, ensure_ascii=False, indent=1)
+        os.replace(tmp_path, self.state_file)
 
 
 STATE = ApiState()
@@ -64,20 +85,24 @@ class Handler(BaseHTTPRequestHandler):
                 self._write_json(400, {"error": "请求体须为 JSON 对象"})
                 return
 
-        for route in STATE.routes:  # type: Route
+        state = getattr(self.server, "state", STATE)
+        for route in state.routes:  # type: Route
             if route.method != method:
                 continue
             match = re.match(route.pattern + r"$", self.path)
             if not match:
                 continue
-            try:
-                payload = route.handler(STATE.registry, body, match.groupdict())
-            except ConflictError as error:
-                self._write_json(409, {"error": str(error)})
-            except DomainError as error:
-                self._write_json(400, {"error": str(error)})
-            else:
-                self._write_json(200, payload)
+            with state.lock:
+                try:
+                    payload = route.handler(state.registry, body, match.groupdict())
+                except ConflictError as error:
+                    self._write_json(409, {"error": str(error)})
+                except DomainError as error:
+                    self._write_json(400, {"error": str(error)})
+                else:
+                    if method == "POST":
+                        state.persist()
+                    self._write_json(200, payload)
             return
 
         self.send_error(404)
@@ -98,6 +123,10 @@ def main():
     parser = argparse.ArgumentParser(description=SERVICE_NAME)
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument(
+        "--state-file", default=None,
+        help="领域状态落盘文件；指定后每次写操作落盘，重启自动恢复",
+    )
     args = parser.parse_args()
     if args.check:
         assert health_payload()["service"] == SERVICE_ID
@@ -106,7 +135,9 @@ def main():
         )
         print("基础检查通过")
         return
-    ThreadingHTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
+    server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
+    server.state = ApiState(args.state_file)
+    server.serve_forever()
 
 
 if __name__ == "__main__":
