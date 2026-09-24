@@ -13,9 +13,14 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
+import json
+import os
 import re
-from dataclasses import dataclass, field
+import tempfile
+import threading
+from dataclasses import asdict, dataclass, field
 from datetime import date
 from typing import Any, Callable, Optional
 
@@ -188,17 +193,25 @@ class Handover:
 
 @dataclass
 class Incident:
-    """损伤事件：冻结后所有未完成交接，图像哈希作为证据保全。"""
+    """损伤事件：冻结后所有未完成交接，图像哈希作为证据保全。
+
+    整件作品的冻结状态完全由“是否仍存在未解除事件”派生，
+    不再单独维护标记，避免多起损伤先后解除时互相覆盖。
+    """
 
     incident_id: str
     work_id: str
-    handover_id: str
+    handover_id: Optional[str]  # 随交接发现时指向交接；复检登记时为 None
     on_date: str
     note: str
     before_hashes: list[str]
     after_hashes: list[str]
     resolved: bool = False
     resolution_note: str = ""
+    reviewer_org: str = ""
+    reviewer_role: str = ""
+    reviewer_person: str = ""
+    resolved_on: Optional[str] = None
 
 
 @dataclass
@@ -219,6 +232,38 @@ class LabelVersion:
 # ---------------------------------------------------------------------------
 
 
+def _command(method: Callable[..., Any]) -> Callable[..., Any]:
+    """写命令装饰器：整段命令在注册表锁内串行执行，成功提交后原子落盘。
+
+    ThreadingHTTPServer 会并发处理请求，事件解除与交接办理必须在同一把
+    锁内完成“读当前状态 → 校验 → 写入”，否则并发解除、或解除与扫码交接
+    之间可能互相覆盖。校验失败抛异常时不落盘，命令保持无副作用。
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: "LoanRegistry", *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            result = method(self, *args, **kwargs)
+            self._save_state()
+            return result
+
+    return wrapper
+
+
+def _query(method: Callable[..., Any]) -> Callable[..., Any]:
+    """只读视图取共享锁的同一把锁，保证视图与命令提交状态一致。
+
+    RLock 可重入：命令内部调用视图（如登记作品后返回作品视图）不会自锁。
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: "LoanRegistry", *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class LoanRegistry:
     """保存全部借展记录并强制业务规则。
 
@@ -226,18 +271,64 @@ class LoanRegistry:
     查询通过 get_work_view / label_version / risk_view 等只读视图。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, state_file: Optional[str] = None) -> None:
+        self._lock = threading.RLock()
+        self._state_file = state_file
         self.works: dict[str, Work] = {}
         self.agreements: dict[str, Agreement] = {}
         self._agreement_history: dict[str, list[str]] = {}  # work_id → 协议ID（含历史版本）
         self.handovers: list[Handover] = []
         self._scan_codes: set[str] = set()
         self.incidents: list[Incident] = []
-        self._frozen_works: set[str] = set()
         self.labels: dict[str, list[LabelVersion]] = {}
+        if state_file and os.path.exists(state_file) and os.path.getsize(state_file) > 0:
+            self._load_state()
+
+    # -- 命令串行化与派生状态 ------------------------------------------------
+
+    def _open_incidents(self, work_id: str) -> list[Incident]:
+        return [i for i in self.incidents if i.work_id == work_id and not i.resolved]
+
+    def _is_frozen(self, work_id: str) -> bool:
+        """冻结完全派生自未解除事件：任一事件仍开放，作品就仍冻结。"""
+        return bool(self._open_incidents(work_id))
+
+    def _public_incident_view(self, incident: Incident) -> dict[str, Any]:
+        """风险视图对外的事件信息（开放事件）。"""
+        return {
+            "incident_id": incident.incident_id,
+            "handover_id": incident.handover_id,
+            "on_date": incident.on_date,
+            "note": incident.note,
+            "before_hashes": incident.before_hashes,
+            "after_hashes": incident.after_hashes,
+        }
+
+    def _incident_view(self, incident: Incident) -> dict[str, Any]:        return {
+            "incident_id": incident.incident_id,
+            "work_id": incident.work_id,
+            "handover_id": incident.handover_id,
+            "on_date": incident.on_date,
+            "note": incident.note,
+            "before_hashes": incident.before_hashes,
+            "after_hashes": incident.after_hashes,
+            "resolved": incident.resolved,
+            "resolution_note": incident.resolution_note,
+            "reviewer": (
+                {
+                    "org": incident.reviewer_org,
+                    "role": incident.reviewer_role,
+                    "person": incident.reviewer_person,
+                }
+                if incident.reviewer_person
+                else None
+            ),
+            "resolved_on": incident.resolved_on,
+        }
 
     # -- 作品结构 ----------------------------------------------------------
 
+    @_command
     def register_work(
         self,
         title: str,
@@ -300,6 +391,7 @@ class LoanRegistry:
 
     # -- 协议 --------------------------------------------------------------
 
+    @_command
     def create_agreement(self, payload: dict[str, Any]) -> dict[str, Any]:
         work = self._work(payload["work_id"])
         agreement_id = payload.get("agreement_id") or f"AGR-{work.work_id}-v1"
@@ -309,6 +401,7 @@ class LoanRegistry:
         self._agreement_history.setdefault(work.work_id, []).append(agreement_id)
         return self._agreement_view(agreement)
 
+    @_command
     def reschedule_agreement(
         self, current_agreement_id: str, changes: dict[str, Any]
     ) -> dict[str, Any]:
@@ -317,7 +410,7 @@ class LoanRegistry:
         if old is None:
             raise DomainError(f"协议 {current_agreement_id} 不存在")
         work = self._work(old.work_id)
-        if work.work_id in self._frozen_works:
+        if self._is_frozen(work.work_id):
             raise ConflictError(f"作品 {work.work_id} 已因损伤冻结，须先解除风险")
 
         merged: dict[str, Any] = {
@@ -377,6 +470,7 @@ class LoanRegistry:
 
     # -- 状态交接 ----------------------------------------------------------
 
+    @_command
     def record_handover(self, payload: dict[str, Any]) -> dict[str, Any]:
         work = self._work(payload["work_id"])
         handover_type = payload["type"]
@@ -384,7 +478,9 @@ class LoanRegistry:
             raise DomainError(f"交接类型须为 {HANDOVER_TYPES} 之一")
 
         # 冻结与生命周期先校验，未成立的交接不得消费扫码标识。
-        if work.work_id in self._frozen_works:
+        # 冻结派生自未解除事件：连续两次受损时，解除其中任何一起
+        # 都不会放行交接，必须全部复核解除。
+        if self._is_frozen(work.work_id):
             raise ConflictError(f"作品 {work.work_id} 已因损伤冻结，后续交接全部中止")
 
         scan_code = str(payload["scan_code"])
@@ -422,7 +518,6 @@ class LoanRegistry:
         self.handovers.append(handover)
 
         if handover.damaged:
-            self._frozen_works.add(work.work_id)
             incident = Incident(
                 incident_id=_new_id("incident"),
                 work_id=work.work_id,
@@ -437,22 +532,102 @@ class LoanRegistry:
 
         return self._handover_view(handover, frozen=False)
 
-    def resolve_incident(self, incident_id: str, resolution_note: str) -> dict[str, Any]:
-        """损伤经双方确认解除后解冻；解除前风险一直挂账。"""
+    @_command
+    def register_reinspection_incident(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """冻结待复核期间的复检/现场检查再发现损伤时，追加登记一起事件。
+
+        复检不构成五段交接之一：不推进交接生命周期、不消费扫码，仅在
+        已冻结的作品上再挂一起开放事件。这样同一件作品可以同时有多起
+        未解除事件，解除必须逐笔复核，任一开放都继续阻断交接。
+        """
+        work = self._work(payload["work_id"])
+        if not self._is_frozen(work.work_id):
+            raise ConflictError(
+                f"作品 {work.work_id} 当前没有未解除损伤，复检损伤应随状态报告登记"
+            )
+        note = str(payload.get("damage_note", "") or "").strip()
+        if not note:
+            raise DomainError("损伤报告必须填写损伤说明")
+        on_date = self._date(payload["on_date"], "复检日期").isoformat()
+        incident = Incident(
+            incident_id=_new_id("incident"),
+            work_id=work.work_id,
+            handover_id=None,
+            on_date=on_date,
+            note=note,
+            before_hashes=[self._image_hash(h) for h in payload.get("before_hashes", [])],
+            after_hashes=[self._image_hash(h) for h in payload.get("after_hashes", [])],
+        )
+        self.incidents.append(incident)
+        return self._incident_view(incident)
+
+    @_command
+    def resolve_incident(
+        self,
+        incident_id: str,
+        resolution_note: str,
+        reviewer: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """凭书面复核结论关闭一起损伤事件。
+
+        - 幂等：已解除的事件再次提交，原样返回既有结论，不覆盖复核记录，
+          也不影响其他事件（特别是不会把仍开放的事件“顺带解冻”）；
+        - 冻结状态由全部事件派生：只有最后一起开放事件关闭时才解冻；
+        - 解除记录须校验作品归属、当前状态（开放）与复核责任方签认。
+        """
         incident = next((i for i in self.incidents if i.incident_id == incident_id), None)
         if incident is None:
             raise DomainError(f"损伤事件 {incident_id} 不存在")
-        if not resolution_note or not resolution_note.strip():
+
+        # 幂等优先：已关闭事件的重复提交直接回放既有结果。
+        if incident.resolved:
+            return self._resolution_view(incident, idempotent=True)
+
+        note = (resolution_note or "").strip()
+        if not note:
             raise DomainError("解除损伤须填写处理与复核结论")
+        # 事件必须能关联回在档作品，防止脱离作品的解除记录落账。
+        self._work(incident.work_id)
+        signature = self._reviewer_signature(reviewer)
+
         incident.resolved = True
-        incident.resolution_note = resolution_note.strip()
-        self._frozen_works.discard(incident.work_id)
+        incident.resolution_note = note
+        incident.reviewer_org = signature.org
+        incident.reviewer_role = signature.role
+        incident.reviewer_person = signature.person
+        incident.resolved_on = date.today().isoformat()
+        return self._resolution_view(incident, idempotent=False)
+
+    def _resolution_view(self, incident: Incident, idempotent: bool) -> dict[str, Any]:
+        open_incidents = self._open_incidents(incident.work_id)
         return {
             "incident_id": incident.incident_id,
             "work_id": incident.work_id,
             "resolved": True,
             "resolution_note": incident.resolution_note,
+            "reviewer": {
+                "org": incident.reviewer_org,
+                "role": incident.reviewer_role,
+                "person": incident.reviewer_person,
+            },
+            "resolved_on": incident.resolved_on,
+            "idempotent": idempotent,
+            "frozen": bool(open_incidents),
+            "open_incident_ids": [i.incident_id for i in open_incidents],
         }
+
+    @staticmethod
+    def _reviewer_signature(raw: Optional[dict[str, Any]]) -> Signature:
+        """复核责任：须由承借馆与出借馆双方中的责任角色书面签认。"""
+        if not raw or not raw.get("person"):
+            raise DomainError("解除损伤须由复核责任人签认")
+        role = raw.get("role")
+        if role not in ("出借馆", "承借馆"):
+            raise DomainError("复核责任人须为出借馆或承借馆角色")
+        org = str(raw.get("org", "")).strip()
+        if not org:
+            raise DomainError("复核签认须注明责任机构")
+        return Signature(org=org, role=role, person=str(raw["person"]).strip())
 
     def _assert_lifecycle(self, work_id: str, handover_type: str) -> None:
         completed = [h.type for h in self.handovers if h.work_id == work_id]
@@ -499,6 +674,7 @@ class LoanRegistry:
 
     # -- 策展展签 ----------------------------------------------------------
 
+    @_command
     def create_label(self, work_id: str, narrative: str, citations: list[dict[str, str]]) -> dict[str, Any]:
         work = self._work(work_id)
         if work_id in self.labels:
@@ -517,6 +693,7 @@ class LoanRegistry:
         self.labels[work_id] = [version]
         return self._label_view(work_id, version)
 
+    @_command
     def publish_label(self, work_id: str, published_on: str) -> dict[str, Any]:
         """发布日期确认：锁定证据快照。快照只含当时的数据，之后不再变化。"""
         versions = self.labels.get(work_id)
@@ -532,6 +709,7 @@ class LoanRegistry:
         current.evidence = self._evidence_snapshot(work_id)
         return self._label_view(work_id, current)
 
+    @_command
     def correct_label(self, work_id: str, narrative: str, citations: list[dict[str, str]]) -> dict[str, Any]:
         """学术更正：另起新版本，旧版展签与其证据快照原样保留。"""
         versions = self.labels.get(work_id)
@@ -558,16 +736,7 @@ class LoanRegistry:
         agreement = self._current_agreement(work_id)
         handovers = [self._handover_view(h) for h in self.handovers if h.work_id == work_id]
         open_incidents = [
-            {
-                "incident_id": i.incident_id,
-                "handover_id": i.handover_id,
-                "on_date": i.on_date,
-                "note": i.note,
-                "before_hashes": i.before_hashes,
-                "after_hashes": i.after_hashes,
-            }
-            for i in self.incidents
-            if i.work_id == work_id and not i.resolved
+            self._public_incident_view(i) for i in self._open_incidents(work_id)
         ]
         return {
             "snapshot_on": date.today().isoformat(),
@@ -613,6 +782,7 @@ class LoanRegistry:
 
     # -- 查询视图 ----------------------------------------------------------
 
+    @_query
     def get_work_view(self, work_id: str) -> dict[str, Any]:
         work = self._work(work_id)
         agreement = self._current_agreement(work_id)
@@ -646,31 +816,25 @@ class LoanRegistry:
             "current_agreement": agreement.agreement_id if agreement else None,
             "agreement_versions": list(self._agreement_history.get(work_id, [])),
             "custody": self._custody(work_id),
-            "frozen": work_id in self._frozen_works,
+            "frozen": self._is_frozen(work_id),
+            "open_incident_ids": [i.incident_id for i in self._open_incidents(work_id)],
         }
 
+    @_query
     def risk_view(self, work_id: str) -> dict[str, Any]:
         """从展签/策展侧回答：实体在哪、谁保管、授权到哪、风险是否解除。"""
         work = self._work(work_id)
         agreement = self._current_agreement(work_id)
-        open_incidents = [i for i in self.incidents if i.work_id == work_id and not i.resolved]
+        open_incidents = self._open_incidents(work_id)
         return {
             "work": work.to_ref(),
             "custody": self._custody(work_id),
             "authorization": agreement.authorization_scope() if agreement else None,
-            "open_risks": [
-                {
-                    "incident_id": i.incident_id,
-                    "on_date": i.on_date,
-                    "note": i.note,
-                    "before_hashes": i.before_hashes,
-                    "after_hashes": i.after_hashes,
-                }
-                for i in open_incidents
-            ],
-            "frozen": work_id in self._frozen_works,
+            "open_risks": [self._public_incident_view(i) for i in open_incidents],
+            "frozen": bool(open_incidents),
         }
 
+    @_query
     def locate_segment(self, work_id: str, segment_id: str) -> dict[str, Any]:
         """局部状态争议入口：从区段定位实体、贡献、当前保管与风险。"""
         work = self._work(work_id)
@@ -717,9 +881,11 @@ class LoanRegistry:
             "custody": self._custody(work_id),
             "segment_handovers": segment_handovers,
             "segment_incidents": segment_incidents,
-            "frozen": work_id in self._frozen_works,
+            "frozen": self._is_frozen(work_id),
+            "open_incident_ids": [i.incident_id for i in self._open_incidents(work_id)],
         }
 
+    @_query
     def label_version(self, work_id: str, version: Optional[int] = None) -> dict[str, Any]:
         versions = self.labels.get(self._work(work_id).work_id)
         if not versions:
@@ -824,6 +990,70 @@ class LoanRegistry:
             "evidence_snapshot": version.evidence,
         }
 
+    # -- 快照持久化（服务重启后恢复冻结/解除状态） --------------------------
+
+    def _save_state(self) -> None:
+        if not self._state_file:
+            return
+        snapshot = {
+            "schema": 1,
+            "id_counters": dict(_new_id.counter),
+            "works": [asdict(w) for w in self.works.values()],
+            "agreements": [asdict(a) for a in self.agreements.values()],
+            "agreement_history": {k: list(v) for k, v in self._agreement_history.items()},
+            "handovers": [asdict(h) for h in self.handovers],
+            "scan_codes": sorted(self._scan_codes),
+            "incidents": [asdict(i) for i in self.incidents],
+            "labels": {
+                work_id: [asdict(version) for version in versions]
+                for work_id, versions in self.labels.items()
+            },
+        }
+        directory = os.path.dirname(os.path.abspath(self._state_file))
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".loan-state-", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(snapshot, handle, ensure_ascii=False)
+            os.replace(tmp_path, self._state_file)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+
+    def _load_state(self) -> None:
+        with open(self._state_file, "r", encoding="utf-8") as handle:
+            snapshot = json.load(handle)
+        for raw in snapshot.get("works", []):
+            segments = [Segment(**item) for item in raw.pop("segments")]
+            contributions = [Contribution(**item) for item in raw.pop("contributions")]
+            work = Work(**raw)
+            work.segments = segments
+            work.contributions = contributions
+            self.works[work.work_id] = work
+        for raw in snapshot.get("agreements", []):
+            agreement = Agreement(**raw)
+            self.agreements[agreement.agreement_id] = agreement
+        self._agreement_history = {
+            key: list(value) for key, value in snapshot.get("agreement_history", {}).items()
+        }
+        for raw in snapshot.get("handovers", []):
+            handover = Handover(
+                from_party=Signature(**raw.pop("from_party")),
+                to_party=Signature(**raw.pop("to_party")),
+                report=ConditionReport(**raw.pop("report")),
+                **raw,
+            )
+            self.handovers.append(handover)
+        self._scan_codes = set(snapshot.get("scan_codes", []))
+        for raw in snapshot.get("incidents", []):
+            self.incidents.append(Incident(**raw))
+        for work_id, versions in snapshot.get("labels", {}).items():
+            self.labels[work_id] = [LabelVersion(**item) for item in versions]
+        # 冻结状态不入库：重启后由 incidents 中的 resolved 标记重新派生。
+        for prefix, value in snapshot.get("id_counters", {}).items():
+            _new_id.counter[prefix] = max(_new_id.counter.get(prefix, 0), int(value))
+
 
 # ---------------------------------------------------------------------------
 # 应用外观：供 HTTP 层调用
@@ -851,8 +1081,11 @@ def build_routes() -> list[Route]:
         Route("POST", r"^/agreements/(?P<id>[^/]+)/reschedule$",
               lambda reg, body, p: reg.reschedule_agreement(p["id"], body)),
         Route("POST", r"^/handovers$", lambda reg, body, _: reg.record_handover(body)),
+        Route("POST", r"^/works/(?P<id>[^/]+)/incidents$",
+              lambda reg, body, p: reg.register_reinspection_incident({**body, "work_id": p["id"]})),
         Route("POST", r"^/incidents/(?P<id>[^/]+)/resolve$",
-              lambda reg, body, p: reg.resolve_incident(p["id"], body.get("resolution_note", ""))),
+              lambda reg, body, p: reg.resolve_incident(
+                  p["id"], body.get("resolution_note", ""), body.get("reviewer"))),
         Route("POST", r"^/works/(?P<id>[^/]+)/labels$",
               lambda reg, body, p: reg.create_label(p["id"], body["narrative"], body.get("citations", []))),
         Route("POST", r"^/works/(?P<id>[^/]+)/labels/publish$",

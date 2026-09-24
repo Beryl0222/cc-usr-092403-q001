@@ -27,14 +27,26 @@ def health_payload():
 
 
 class ApiState:
-    """进程内共享的领域记录（单实例部署足够；多实例需换持久层）。"""
+    """进程内共享的领域记录。
 
-    def __init__(self):
-        self.registry = LoanRegistry()
+    传入 state_file 后，每条写命令成功提交即原子落盘，重启时从快照
+    恢复（冻结标记不入库，由未解除损伤事件重新派生）；缺省为纯内存。
+    """
+
+    def __init__(self, state_file: str | None = None):
+        self.state_file = state_file
+        self.registry = LoanRegistry(state_file=state_file)
         self.routes = build_routes()
 
 
 STATE = ApiState()
+
+
+def configure_state(state_file: str | None = None) -> ApiState:
+    """替换全局状态（启动或测试“重启恢复”时使用）。"""
+    global STATE
+    STATE = ApiState(state_file)
+    return STATE
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -98,7 +110,11 @@ def main():
     parser = argparse.ArgumentParser(description=SERVICE_NAME)
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--state-file", default=None,
+                        help="状态快照路径；提供后写命令原子落盘，重启自动恢复")
     args = parser.parse_args()
+    if args.state_file:
+        configure_state(args.state_file)
     if args.check:
         assert health_payload()["service"] == SERVICE_ID
         LoanRegistry().register_work(
